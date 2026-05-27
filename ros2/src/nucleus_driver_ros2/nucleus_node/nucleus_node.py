@@ -44,6 +44,7 @@ class NucleusNode(Node):
         self.declare_parameter('world_frame_id', 'world')
         self.declare_parameter('connection_type', 'none')
         self.declare_parameter('tcp_ip', '')
+        self.declare_parameter('tcp_port', 9000)
         self.declare_parameter('tcp_password', 'nortek')
         self.declare_parameter('serial_port', '')
         self.declare_parameter('auto_connect', False)
@@ -56,6 +57,7 @@ class NucleusNode(Node):
         self.world_frame_id = self.get_parameter('world_frame_id').get_parameter_value().string_value
         self._connection_type = self.get_parameter('connection_type').get_parameter_value().string_value
         self._tcp_ip = self.get_parameter('tcp_ip').get_parameter_value().string_value
+        self._tcp_port = self.get_parameter('tcp_port').get_parameter_value().integer_value
         self._tcp_password = self.get_parameter('tcp_password').get_parameter_value().string_value
         self._serial_port = self.get_parameter('serial_port').get_parameter_value().string_value
         self._auto_connect = self.get_parameter('auto_connect').get_parameter_value().bool_value
@@ -132,9 +134,29 @@ class NucleusNode(Node):
             
             if status:
                 self.get_logger().info("Successfully connected to sensor.")
-                
+
+                # The streaming port (9002) is a read-only data stream: no login,
+                # no commands. Configuration and start/stop are owned by whatever
+                # client holds the command port (e.g. the Nortek software). Skip
+                # any config/start so we never write to the read-only socket.
+                streaming_only = self._connection_type == 'tcp' and self._tcp_port == 9002
+                if streaming_only:
+                    self.get_logger().info(
+                        "Connected on streaming port 9002 (listen-only). "
+                        "Skipping sensor configuration and auto-start; "
+                        "configure and start/stop the device via the Nortek software."
+                    )
+                    if self._sensor_configs:
+                        self.get_logger().warn(
+                            "sensor_configs is set but will be ignored in listen-only mode."
+                        )
+                    if self._auto_start:
+                        self.get_logger().warn(
+                            "auto_start is set but will be ignored in listen-only mode."
+                        )
+
                 # Send configuration commands
-                if self._sensor_configs:
+                if self._sensor_configs and not streaming_only:
                     self.get_logger().info("Sending configuration commands...")
                     all_configs_ok = True
                     for cmd in self._sensor_configs:
@@ -158,7 +180,7 @@ class NucleusNode(Node):
 
 
                 # Auto-start measurement
-                if self._auto_start:
+                if self._auto_start and not streaming_only:
                     self.get_logger().info("Auto-start is enabled. Starting measurement.")
                     reply_bytes = self.nucleus_driver.start_measurement()
                     try:
@@ -183,12 +205,12 @@ class NucleusNode(Node):
             self.packet_thread.join(timeout=2)
 
     def _connect_tcp(self, host, password):
-        self.nucleus_driver.set_tcp_configuration(host=host)
+        self.nucleus_driver.set_tcp_configuration(host=host, port=self._tcp_port)
         status = self.nucleus_driver.connect(connection_type="tcp", password=password)
         if status:
-            self.get_logger().info(f"Connected through TCP with host: {host}")
+            self.get_logger().info(f"Connected through TCP with host: {host}:{self._tcp_port}")
         else:
-            self.get_logger().error(f"Failed to connect with host: {host}")
+            self.get_logger().error(f"Failed to connect with host: {host}:{self._tcp_port}")
         return status
 
     def _connect_serial(self, port):
