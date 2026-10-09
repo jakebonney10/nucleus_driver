@@ -2,6 +2,8 @@ import rclpy
 import rcl_interfaces
 from rclpy.node import Node
 from threading import Thread
+import time
+import socket
 from rclpy._rclpy_pybind11 import RCLError
 import math
 
@@ -49,6 +51,17 @@ class NucleusNode(Node):
         self.declare_parameter('serial_port', '')
         self.declare_parameter('auto_connect', False)
         self.declare_parameter('auto_start', False)
+        # Reconnection. The driver historically connected exactly once, during
+        # node init: if that failed it logged an error and ran on forever with no
+        # connection, and a link that dropped later was never noticed because the
+        # read loop simply kept timing out. These two drive the retry loop in
+        # packet_handling(). Set either <= 0 to restore the old one-shot behaviour.
+        self.declare_parameter('reconnect_interval_s', 2.0)
+        self.declare_parameter('data_timeout_s', 5.0)
+        # Seconds of idle before TCP keepalive probing starts. Without keepalive a
+        # yanked cable leaves a half-open socket that recv() never reports, so the
+        # kernel is what has to notice. <= 0 leaves the OS defaults (~2 hours).
+        self.declare_parameter('tcp_keepalive_idle_s', 5)
         self.declare_parameter('sensor_configs', rcl_interfaces.msg.ParameterValue(type=rcl_interfaces.msg.ParameterType.PARAMETER_STRING_ARRAY))
         self.declare_parameter('fluid_density', 1000.0)
 
@@ -62,6 +75,9 @@ class NucleusNode(Node):
         self._serial_port = self.get_parameter('serial_port').get_parameter_value().string_value
         self._auto_connect = self.get_parameter('auto_connect').get_parameter_value().bool_value
         self._auto_start = self.get_parameter('auto_start').get_parameter_value().bool_value
+        self._reconnect_interval_s = self.get_parameter('reconnect_interval_s').value
+        self._data_timeout_s = self.get_parameter('data_timeout_s').value
+        self._tcp_keepalive_idle_s = self.get_parameter('tcp_keepalive_idle_s').value
         self._sensor_configs = self.get_parameter('sensor_configs').get_parameter_value().string_array_value
         self._fluid_density = self.get_parameter('fluid_density').value
 
@@ -105,6 +121,10 @@ class NucleusNode(Node):
         self.init_timer = self.create_timer(0.1, self.initialize_sensor_connection)
 
         self._thread_running = False
+        # Monotonic stamp of the last packet off the wire, used to spot a link that
+        # went away without the socket reporting an error (half-open TCP). None
+        # means "no link", so the retry loop owns the next attempt.
+        self._last_packet_time = None
         self.packet_thread = Thread(target=self.packet_handling)
 
         self.get_logger().info("Nucleus Node initiated")
@@ -113,86 +133,189 @@ class NucleusNode(Node):
         """
         Attempts to connect and configure the sensor based on launch parameters.
         This method is called once by a timer after node initialization.
+
+        A failure here is no longer fatal to the session: the packet handling
+        thread retries on reconnect_interval_s, so the node recovers by itself
+        once the device shows up.
         """
         self.init_timer.cancel()
 
         if self._auto_connect:
             self.get_logger().info("Auto-connect is enabled. Attempting to connect to sensor...")
-            status = False
-            if self._connection_type == 'tcp':
-                if not self._tcp_ip:
-                    self.get_logger().error("Connection type is 'tcp' but 'tcp_ip' parameter is not set.")
-                else:
-                    status = self._connect_tcp(self._tcp_ip, self._tcp_password)
-            elif self._connection_type == 'serial':
-                if not self._serial_port:
-                    self.get_logger().error("Connection type is 'serial' but 'serial_port' parameter is not set.")
-                else:
-                    status = self._connect_serial(self._serial_port)
-            elif self._connection_type != 'none':
-                self.get_logger().warn(f"Invalid connection_type '{self._connection_type}'. Skipping auto-connect.")
-            
-            if status:
-                self.get_logger().info("Successfully connected to sensor.")
-
-                # The streaming port (9002) is a read-only data stream: no login,
-                # no commands. Configuration and start/stop are owned by whatever
-                # client holds the command port (e.g. the Nortek software). Skip
-                # any config/start so we never write to the read-only socket.
-                streaming_only = self._connection_type == 'tcp' and self._tcp_port == 9002
-                if streaming_only:
-                    self.get_logger().info(
-                        "Connected on streaming port 9002 (listen-only). "
-                        "Skipping sensor configuration and auto-start; "
-                        "configure and start/stop the device via the Nortek software."
-                    )
-                    if self._sensor_configs:
-                        self.get_logger().warn(
-                            "sensor_configs is set but will be ignored in listen-only mode."
-                        )
-                    if self._auto_start:
-                        self.get_logger().warn(
-                            "auto_start is set but will be ignored in listen-only mode."
-                        )
-
-                # Send configuration commands
-                if self._sensor_configs and not streaming_only:
-                    self.get_logger().info("Sending configuration commands...")
-                    all_configs_ok = True
-                    for cmd in self._sensor_configs:
-                        reply_bytes = self.nucleus_driver.send_command(command=cmd)
-                        try:
-                            reply_str = "".join(r.decode() for r in reply_bytes).strip()
-                            # A successful command usually replies with 'OK'
-                            if "OK" in reply_str:
-                                self.get_logger().info(f"Command '{cmd}' -> Reply: '{reply_str}'")
-                            else:
-                                self.get_logger().warn(f"Command '{cmd}' -> Unexpected Reply: '{reply_str}'")
-                                all_configs_ok = False
-                        except Exception as e:
-                            self.get_logger().error(f"Failed to decode or process reply for command '{cmd}': {e}")
-                            all_configs_ok = False
-                    
-                    if all_configs_ok:
-                        self.get_logger().info("All sensor configuration commands sent successfully.")
-                    else:
-                        self.get_logger().warn("One or more sensor configuration commands may have failed. Please check logs.")
-
-
-                # Auto-start measurement
-                if self._auto_start and not streaming_only:
-                    self.get_logger().info("Auto-start is enabled. Starting measurement.")
-                    reply_bytes = self.nucleus_driver.start_measurement()
-                    try:
-                        reply_str = reply_bytes[0].decode().strip()
-                        self.get_logger().info(f"Start measurement reply: '{reply_str}'")
-                    except Exception as e:
-                        self.get_logger().error(f"Failed to decode reply from start command: {e}")
+            if self._attempt_connection():
+                self._post_connect_setup()
+            elif self._reconnect_interval_s > 0:
+                self.get_logger().warn(
+                    f"Initial connection failed; retrying every {self._reconnect_interval_s} s "
+                    "from the packet handler.")
         else:
             self.get_logger().info("Auto-connect is disabled. Waiting for service calls.")
 
         # Start the packet handling thread regardless
         self.start()
+
+    def _attempt_connection(self):
+        """
+        One connection attempt over the configured transport; True on success.
+        Shared by initialize_sensor_connection() and the retry loop so both
+        paths behave identically.
+        """
+        status = False
+        if self._connection_type == 'tcp':
+            if not self._tcp_ip:
+                self.get_logger().error("Connection type is 'tcp' but 'tcp_ip' parameter is not set.")
+            else:
+                status = self._connect_tcp(self._tcp_ip, self._tcp_password)
+        elif self._connection_type == 'serial':
+            if not self._serial_port:
+                self.get_logger().error("Connection type is 'serial' but 'serial_port' parameter is not set.")
+            else:
+                status = self._connect_serial(self._serial_port)
+        elif self._connection_type != 'none':
+            self.get_logger().warn(f"Invalid connection_type '{self._connection_type}'. Skipping auto-connect.")
+
+        if status:
+            self._enable_tcp_keepalive()
+            # Only start the data-timeout clock once there is a link to watch.
+            self._last_packet_time = time.monotonic()
+        return status
+
+    def _tcp_socket(self):
+        if self._connection_type != 'tcp':
+            return None
+        return getattr(self.nucleus_driver.connection, 'tcp', None)
+
+    def _enable_tcp_keepalive(self):
+        """
+        Ask the kernel to probe the peer so a vanished device (cable pulled,
+        power cut) turns into a socket error instead of a socket that blocks
+        forever. Same reasoning as sprintnav_driver's TcpClientTransport.
+        """
+        sock = self._tcp_socket()
+        if sock is None or self._tcp_keepalive_idle_s <= 0:
+            return
+        idle = int(self._tcp_keepalive_idle_s)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            # Linux-only knobs; guarded individually so a missing one is not fatal.
+            for opt, val in (('TCP_KEEPIDLE', idle),
+                             ('TCP_KEEPINTVL', max(1, idle // 2)),
+                             ('TCP_KEEPCNT', 3)):
+                if hasattr(socket, opt):
+                    sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, opt), val)
+            self.get_logger().info(
+                f"TCP keepalive enabled (idle {idle} s); a dead peer surfaces in "
+                f"roughly {idle + 3 * max(1, idle // 2)} s.")
+        except Exception as e:
+            self.get_logger().warn(f"Could not enable TCP keepalive: {e}")
+
+    def _socket_is_healthy(self):
+        """
+        Cheap, non-destructive liveness check run from the packet thread.
+
+        Needed because the driver's own get_connection_status() is just a flag
+        set at connect time: it never goes false when the peer dies. Two things
+        are checked here that read_packet() cannot distinguish from a quiet
+        device: a pending socket error (what keepalive eventually produces), and
+        a peer that closed cleanly, where recv() returns EOF forever. MSG_PEEK
+        means the probe never consumes bytes the parser needs, and this runs on
+        the same thread as the reader, so it cannot race it.
+        """
+        sock = self._tcp_socket()
+        if sock is None:
+            return True
+        try:
+            if sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR) != 0:
+                return False
+            if sock.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT) == b'':
+                return False   # orderly shutdown from the far end
+        except (BlockingIOError, socket.timeout):
+            return True        # nothing pending, which is normal
+        except OSError:
+            return False
+        return True
+
+    def _post_connect_setup(self):
+        """
+        Push configuration and start measurement after a successful connect.
+        Re-run on every reconnect: a device that was power-cycled has lost
+        whatever was sent to it last time.
+        """
+        self.get_logger().info("Successfully connected to sensor.")
+
+        # The streaming port (9002) is a read-only data stream: no login,
+        # no commands. Configuration and start/stop are owned by whatever
+        # client holds the command port (e.g. the Nortek software). Skip
+        # any config/start so we never write to the read-only socket.
+        streaming_only = self._connection_type == 'tcp' and self._tcp_port == 9002
+        if streaming_only:
+            self.get_logger().info(
+                "Connected on streaming port 9002 (listen-only). "
+                "Skipping sensor configuration and auto-start; "
+                "configure and start/stop the device via the Nortek software."
+            )
+            if self._sensor_configs:
+                self.get_logger().warn(
+                    "sensor_configs is set but will be ignored in listen-only mode."
+                )
+            if self._auto_start:
+                self.get_logger().warn(
+                    "auto_start is set but will be ignored in listen-only mode."
+                )
+
+        # Send configuration commands
+        if self._sensor_configs and not streaming_only:
+            self.get_logger().info("Sending configuration commands...")
+            all_configs_ok = True
+            for cmd in self._sensor_configs:
+                reply_bytes = self.nucleus_driver.send_command(command=cmd)
+                try:
+                    reply_str = "".join(r.decode() for r in reply_bytes).strip()
+                    # A successful command usually replies with 'OK'
+                    if "OK" in reply_str:
+                        self.get_logger().info(f"Command '{cmd}' -> Reply: '{reply_str}'")
+                    else:
+                        self.get_logger().warn(f"Command '{cmd}' -> Unexpected Reply: '{reply_str}'")
+                        all_configs_ok = False
+                except Exception as e:
+                    self.get_logger().error(f"Failed to decode or process reply for command '{cmd}': {e}")
+                    all_configs_ok = False
+            
+            if all_configs_ok:
+                self.get_logger().info("All sensor configuration commands sent successfully.")
+            else:
+                self.get_logger().warn("One or more sensor configuration commands may have failed. Please check logs.")
+
+
+        # Auto-start measurement
+        if self._auto_start and not streaming_only:
+            self.get_logger().info("Auto-start is enabled. Starting measurement.")
+            reply_bytes = self.nucleus_driver.start_measurement()
+            try:
+                reply_str = reply_bytes[0].decode().strip()
+                self.get_logger().info(f"Start measurement reply: '{reply_str}'")
+            except Exception as e:
+                self.get_logger().error(f"Failed to decode reply from start command: {e}")
+
+    def _is_connected(self):
+        try:
+            return bool(self.nucleus_driver.connection.get_connection_status())
+        except Exception:
+            return False
+
+    def _handle_connection_loss(self, reason):
+        """
+        Drop the link so the retry loop rebuilds it from scratch. Only ever
+        called from the packet thread, which is also the only reader, so there
+        is no concurrent socket use to guard against.
+        """
+        self.get_logger().warn(f"Connection lost: {reason}. Will reconnect.")
+        self._last_packet_time = None
+        try:
+            if self._is_connected():
+                self.nucleus_driver.disconnect()
+        except Exception as e:
+            self.get_logger().warn(f"Error while closing the dropped connection: {e}")
 
     def start(self):
         self._thread_running = True
@@ -321,10 +444,34 @@ class NucleusNode(Node):
 
         while self._thread_running and rclpy.ok():
 
+            # Reconnect loop. This thread is the only reader of the socket, so
+            # owning (re)connection here keeps all socket access single-threaded
+            # and needs no locking against the read below.
+            if self._auto_connect and self._reconnect_interval_s > 0 and (
+                    not self._is_connected() or not self._socket_is_healthy()):
+                if self._is_connected():
+                    self._handle_connection_loss("socket no longer healthy")
+                time.sleep(self._reconnect_interval_s)
+                if not (self._thread_running and rclpy.ok()):
+                    break
+                if self._attempt_connection():
+                    self._post_connect_setup()
+                continue
+
             packet = self.nucleus_driver.read_packet(timeout=1, _suppress_warning=True)
 
             if packet is None:
+                # A read timeout is normal when the device is simply quiet, but a
+                # half-open TCP link looks exactly the same from here: the socket
+                # never errors and read_packet just keeps returning None. Treat a
+                # long enough silence as a dead link so the loop above rebuilds it.
+                if (self._data_timeout_s > 0 and self._last_packet_time is not None
+                        and time.monotonic() - self._last_packet_time > self._data_timeout_s):
+                    self._handle_connection_loss(
+                        f"no data for {self._data_timeout_s} s")
                 continue
+
+            self._last_packet_time = time.monotonic()
 
             system_timestamp = self.get_clock().now()
             ros_timestamp = system_timestamp.to_msg()
