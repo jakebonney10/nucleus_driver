@@ -33,6 +33,7 @@ from std_msgs.msg import Float32
 from sensor_msgs.msg import Imu, MagneticField, FluidPressure, Temperature
 from geometry_msgs.msg import PointStamped, TwistWithCovarianceStamped
 from nav_msgs.msg import Odometry
+from marine_acoustic_msgs.msg import Dvl
 from diagnostic_msgs.msg import DiagnosticStatus
 from diagnostic_updater import Updater
 from nucleus_driver import NucleusDriver
@@ -116,6 +117,11 @@ class NucleusNode(Node):
         self.temperature_publisher = self.create_publisher(Temperature, "nucleus_node/temperature_common", 10)
         self.bottom_track_velocity_publisher = self.create_publisher(TwistWithCovarianceStamped, "nucleus_node/bottom_lock_velocity_common", 10)
         self.water_track_velocity_publisher = self.create_publisher(TwistWithCovarianceStamped, "nucleus_node/water_track_velocity_common", 10)
+        # marine_acoustic_msgs/Dvl: the cross-vendor DVL message, so a consumer
+        # can treat this device and e.g. a Sonardyne the same way. Carries the
+        # per-beam data that the generic Twist above has nowhere to put.
+        self.dvl_publisher = self.create_publisher(Dvl, "nucleus_node/dvl", 10)
+        self.water_track_dvl_publisher = self.create_publisher(Dvl, "nucleus_node/water_track_dvl", 10)
         self.imu_common_publisher = self.create_publisher(Imu, "nucleus_node/imu_common", 10)
         self.mag_common_publisher = self.create_publisher(MagneticField, "nucleus_node/magnetic_common", 10)
 
@@ -567,6 +573,100 @@ class NucleusNode(Node):
 
         return vel_msg
 
+    # Nucleus slanted beam angle off nadir, from the Nucleus 1000 datasheet
+    # (rev 03/23/2025): "Slanted beam angle 20 deg". Kept in step with
+    # slant_deg in rhody's config/sensor_fov.yaml.
+    BEAM_SLANT_RAD = math.radians(20.0)
+
+    def _track_dvl_msg(self, packet, ros_timestamp, velocity_mode):
+        """
+        Build a marine_acoustic_msgs/Dvl from a bottom track (0xB4) or water
+        track (0xBE) packet. Field meanings are from N3015-033 section 8.9.
+
+        Axes, and why this differs from _track_velocity_msg: Dvl.msg documents
+        its own frame convention -- "z-axis in direction DVL is pointing,
+        x-axis aligned with vehicle forward" -- which is FRD, exactly what the
+        Nucleus reports natively. So the raw components go in UNCONVERTED here,
+        while the geometry_msgs Twist (which has no convention of its own and
+        must match its REP-103 frame) gets y and z negated. sprintnav_driver
+        makes the same split. Do not "fix" this to match the Twist.
+        """
+        m = Dvl()
+        m.header.stamp = ros_timestamp
+        m.header.frame_id = self.frame_id
+        m.velocity_mode = velocity_mode
+        # Dvl.msg lists Nortek DVLs under DVL_TYPE_PISTON (one piston
+        # transducer per beam), which is what the Nucleus is.
+        m.dvl_type = Dvl.DVL_TYPE_PISTON
+
+        m.velocity.x = float(packet["velocityX"])
+        m.velocity.y = float(packet["velocityY"])
+        m.velocity.z = float(packet["velocityZ"])
+
+        # FOM is one standard deviation in m/s, so square it. Off-diagonals and
+        # anything the device flagged invalid are -1, which Dvl.msg explicitly
+        # documents as "not known" (unlike geometry_msgs, hence the different
+        # sentinel from _track_velocity_msg).
+        for i in range(9):
+            m.velocity_covar[i] = -1.0
+        for index, fom_key, valid_key in ((0, "fomX", "status.xFomValid"),
+                                          (4, "fomY", "status.yFomValid"),
+                                          (8, "fomZ", "status.zFomValid")):
+            if packet.get(valid_key):
+                m.velocity_covar[index] = float(packet[fom_key]) ** 2
+
+        # Per-beam data. The Nucleus has three slanted beams, so slot 4 of
+        # Dvl.msg's fixed-size [4] arrays is unused and left at its default.
+        good_beams = 0
+        vertical_sum = 0.0
+        for i in range(3):
+            n = i + 1
+            if packet.get(f"status.beam{n}VelocityValid"):
+                m.beam_velocity[i] = float(packet[f"velocityBeam{n}"])
+            else:
+                # Invalid velocities are reported as the sentinel -32.768 m/s.
+                m.beam_velocity_covar[i] = -1.0
+            if packet.get(f"status.beam{n}DistanceValid"):
+                d = float(packet[f"distanceBeam{n}"])
+                vertical_sum += d
+                good_beams += 1
+                # Section 8.9 calls this the "vertical distance to cell along
+                # beam N", i.e. already projected onto nadir, whereas Dvl.msg
+                # wants the slant range along the beam so that
+                # beam_unit_vec*range lands on the seafloor. Undo the
+                # projection. NOTE: that wording is self-contradictory
+                # ("vertical ... along beam"); if a bench check shows these are
+                # raw slant ranges, drop this division and the altitude below
+                # needs a cos() instead.
+                m.range[i] = d / math.cos(self.BEAM_SLANT_RAD)
+            else:
+                m.range_covar[i] = -1.0
+            if packet.get(f"status.beam{n}FomValid"):
+                # Dvl.msg leaves beam_quality DVL-specific; the natural value
+                # here is the per-beam FOM (one sigma, m/s).
+                m.beam_quality[i] = float(packet[f"fomBeam{n}"])
+        # Unused fourth slot.
+        m.range_covar[3] = -1.0
+        m.beam_velocity_covar[3] = -1.0
+
+        m.num_good_beams = good_beams
+        # Average altitude of the good beams. Already vertical per the note
+        # above, so no trigonometric factor is applied.
+        m.altitude = vertical_sum / good_beams if good_beams else 0.0
+        m.beam_ranges_valid = good_beams > 0
+        m.beam_velocities_valid = any(
+            packet.get(f"status.beam{n}VelocityValid") for n in (1, 2, 3))
+
+        # beam_unit_vec is deliberately left zeroed: neither N3015-033 nor the
+        # datasheet maps beam index to azimuth about the instrument x-axis, and
+        # a guessed geometry would silently mislocate every seafloor point.
+        # rhody's sensor_fov.yaml assumes 0/120/240 deg for drawing only.
+
+        m.course_gnd = math.atan2(m.velocity.y, m.velocity.x)
+        m.speed_gnd = math.hypot(m.velocity.x, m.velocity.y)
+        m.sound_speed = float(packet["soundSpeed"])
+        return m
+
     def _listen_only(self):
         return self._connection_type == 'tcp' and self._tcp_port == 9002
 
@@ -921,6 +1021,9 @@ class NucleusNode(Node):
                     if packet["status.xVelocityValid"] and packet["status.yVelocityValid"] and packet["status.zVelocityValid"]:
                         self.bottom_track_velocity_publisher.publish(
                             self._track_velocity_msg(packet, ros_timestamp))
+                        self.dvl_publisher.publish(
+                            self._track_dvl_msg(packet, ros_timestamp,
+                                                Dvl.DVL_MODE_BOTTOM))
                     
                     if packet["status.beam1DistanceValid"]:
                         alt_b1_msg = PointStamped()
@@ -1009,6 +1112,9 @@ class NucleusNode(Node):
                     if packet["status.xVelocityValid"] and packet["status.yVelocityValid"] and packet["status.zVelocityValid"]:
                         self.water_track_velocity_publisher.publish(
                             self._track_velocity_msg(packet, ros_timestamp))
+                        self.water_track_dvl_publisher.publish(
+                            self._track_dvl_msg(packet, ros_timestamp,
+                                                Dvl.DVL_MODE_WATER))
 
                 except RCLError:
                     pass

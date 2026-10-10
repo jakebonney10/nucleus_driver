@@ -16,6 +16,9 @@
        Connection / Decoder / Bottom Track tasks on the global /diagnostics. -->
   <exec_depend>diagnostic_msgs</exec_depend>
   <exec_depend>diagnostic_updater</exec_depend>
+  <!-- Cross-vendor DVL message published on nucleus_node/dvl, so this
+       device and e.g. a Sonardyne can be consumed identically. -->
+  <exec_depend>marine_acoustic_msgs</exec_depend>
   
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
