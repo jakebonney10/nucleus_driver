@@ -534,27 +534,31 @@ class NucleusNode(Node):
         Build the TwistWithCovarianceStamped shared by bottom track (0xB4) and
         water track (0xBE), which carry identical velocity/FOM fields.
 
-        Two things the raw packet fields cannot be used for directly:
+        Axes are published exactly as the device reports them, per REP-145
+        ("all data should be published by the driver as it is reported by the
+        device. Any subsequent modifications to the data (e.g. filtering,
+        transformations) should be delegated to a downstream consumer"). The
+        Nucleus reports XYZ in its instrument-referenced frame - mounted
+        downward-facing (N3015-033 figure 4) that is x-forward, y-starboard,
+        z-down. So frame_id must name a TF frame whose declared rotation IS
+        that instrument frame; the vehicle URDF owns that, not this driver.
+        An earlier revision negated y and z here to force REP-103 axes, which
+        contradicted REP-145 and left the IMU/magnetometer topics in a
+        different convention from the velocity ones.
 
-        * Axes. The Nucleus reports XYZ in instrument-referenced coordinates,
-          and mounted downward-facing (N3015-033 figure 4) that is x-forward,
-          y-starboard, z-down - FRD. The frame this is stamped with is a
-          REP-103 frame (x-forward, y-port, z-up), so y and z are negated.
-          sprintnav_driver does the same conversion for the same reason; before
-          this, the two DVLs on the vehicle published opposite y and z.
-        * Covariance. FOM is "estimated velocity uncertainty reported as one
-          standard deviation", in m/s (N3015-033 section 8.9), so it has to be
-          squared to become a variance. Negating an axis does not change its
-          variance, so the diagonal is unaffected by the FRD->FLU flip.
+        Covariance is the one thing not taken verbatim: FOM is "estimated
+        velocity uncertainty reported as one standard deviation", in m/s
+        (N3015-033 section 8.9), and the message field is a variance, so it is
+        squared. That is filling the message contract, not transforming data.
         """
         vel_msg = TwistWithCovarianceStamped()
         vel_msg.header.stamp = ros_timestamp
         vel_msg.header.frame_id = self.frame_id
 
-        # FRD -> FLU
+        # Instrument axes, unmodified (REP-145).
         vel_msg.twist.twist.linear.x = packet["velocityX"]
-        vel_msg.twist.twist.linear.y = -packet["velocityY"]
-        vel_msg.twist.twist.linear.z = -packet["velocityZ"]
+        vel_msg.twist.twist.linear.y = packet["velocityY"]
+        vel_msg.twist.twist.linear.z = packet["velocityZ"]
 
         # FOM (one sigma, m/s) -> variance. Invalid FOMs are reported by the
         # device as the sentinel 10.0, so honour the validity bits rather than
@@ -583,13 +587,11 @@ class NucleusNode(Node):
         Build a marine_acoustic_msgs/Dvl from a bottom track (0xB4) or water
         track (0xBE) packet. Field meanings are from N3015-033 section 8.9.
 
-        Axes, and why this differs from _track_velocity_msg: Dvl.msg documents
-        its own frame convention -- "z-axis in direction DVL is pointing,
-        x-axis aligned with vehicle forward" -- which is FRD, exactly what the
-        Nucleus reports natively. So the raw components go in UNCONVERTED here,
-        while the geometry_msgs Twist (which has no convention of its own and
-        must match its REP-103 frame) gets y and z negated. sprintnav_driver
-        makes the same split. Do not "fix" this to match the Twist.
+        Axes are the instrument's own, unmodified, like every other topic
+        from this node (REP-145). Dvl.msg additionally documents its own
+        convention -- "z-axis in direction DVL is pointing, x-axis aligned
+        with vehicle forward", i.e. FRD -- which is what the downward-mounted
+        Nucleus reports natively, so the two agree without any conversion.
         """
         m = Dvl()
         m.header.stamp = ros_timestamp
