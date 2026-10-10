@@ -515,6 +515,58 @@ class NucleusNode(Node):
                             "status.beam3DistanceValid")
                 if packet.get(k))
 
+    # Variance to report for a channel the bottom/water track packet does not
+    # measure (angular rates) or whose FOM the device flagged invalid. Large
+    # rather than 0, because 0 reads as "perfectly known" to a filter and
+    # robot_localization will happily believe it. Not -1 either: a negative
+    # variance is not a valid covariance entry and geometry_msgs documents no
+    # such sentinel (marine_acoustic_msgs/Dvl does, and uses it there).
+    UNKNOWN_VARIANCE = 1e6
+
+    def _track_velocity_msg(self, packet, ros_timestamp):
+        """
+        Build the TwistWithCovarianceStamped shared by bottom track (0xB4) and
+        water track (0xBE), which carry identical velocity/FOM fields.
+
+        Two things the raw packet fields cannot be used for directly:
+
+        * Axes. The Nucleus reports XYZ in instrument-referenced coordinates,
+          and mounted downward-facing (N3015-033 figure 4) that is x-forward,
+          y-starboard, z-down - FRD. The frame this is stamped with is a
+          REP-103 frame (x-forward, y-port, z-up), so y and z are negated.
+          sprintnav_driver does the same conversion for the same reason; before
+          this, the two DVLs on the vehicle published opposite y and z.
+        * Covariance. FOM is "estimated velocity uncertainty reported as one
+          standard deviation", in m/s (N3015-033 section 8.9), so it has to be
+          squared to become a variance. Negating an axis does not change its
+          variance, so the diagonal is unaffected by the FRD->FLU flip.
+        """
+        vel_msg = TwistWithCovarianceStamped()
+        vel_msg.header.stamp = ros_timestamp
+        vel_msg.header.frame_id = self.frame_id
+
+        # FRD -> FLU
+        vel_msg.twist.twist.linear.x = packet["velocityX"]
+        vel_msg.twist.twist.linear.y = -packet["velocityY"]
+        vel_msg.twist.twist.linear.z = -packet["velocityZ"]
+
+        # FOM (one sigma, m/s) -> variance. Invalid FOMs are reported by the
+        # device as the sentinel 10.0, so honour the validity bits rather than
+        # squaring the sentinel into a 100 m^2/s^2 variance.
+        for index, fom_key, valid_key in ((0,  "fomX", "status.xFomValid"),
+                                          (7,  "fomY", "status.yFomValid"),
+                                          (14, "fomZ", "status.zFomValid")):
+            if packet.get(valid_key):
+                vel_msg.twist.covariance[index] = packet[fom_key] ** 2
+            else:
+                vel_msg.twist.covariance[index] = self.UNKNOWN_VARIANCE
+
+        # The DVL measures no angular rate at all.
+        for index in (21, 28, 35):
+            vel_msg.twist.covariance[index] = self.UNKNOWN_VARIANCE
+
+        return vel_msg
+
     def _listen_only(self):
         return self._connection_type == 'tcp' and self._tcp_port == 9002
 
@@ -867,17 +919,8 @@ class NucleusNode(Node):
                     self.bottom_track_publisher.publish(bottom_track_packet)
 
                     if packet["status.xVelocityValid"] and packet["status.yVelocityValid"] and packet["status.zVelocityValid"]:
-                        vel_msg = TwistWithCovarianceStamped()
-                        vel_msg.header.stamp = ros_timestamp
-                        vel_msg.header.frame_id = self.frame_id
-                        vel_msg.twist.twist.linear.x = packet["velocityX"]
-                        vel_msg.twist.twist.linear.y = packet["velocityY"]
-                        vel_msg.twist.twist.linear.z = packet["velocityZ"]
-                        vel_msg.twist.covariance[0] = packet["fomX"]
-                        vel_msg.twist.covariance[7] = packet["fomY"]
-                        vel_msg.twist.covariance[14] = packet["fomZ"]
-
-                        self.bottom_track_velocity_publisher.publish(vel_msg)
+                        self.bottom_track_velocity_publisher.publish(
+                            self._track_velocity_msg(packet, ros_timestamp))
                     
                     if packet["status.beam1DistanceValid"]:
                         alt_b1_msg = PointStamped()
@@ -964,16 +1007,8 @@ class NucleusNode(Node):
                     self.water_track_publisher.publish(water_track_packet)
 
                     if packet["status.xVelocityValid"] and packet["status.yVelocityValid"] and packet["status.zVelocityValid"]:
-                        vel_msg = TwistWithCovarianceStamped()
-                        vel_msg.header.stamp = ros_timestamp
-                        vel_msg.header.frame_id = self.frame_id
-                        vel_msg.twist.twist.linear.x = packet["velocityX"]
-                        vel_msg.twist.twist.linear.y = packet["velocityY"]
-                        vel_msg.twist.twist.linear.z = packet["velocityZ"]
-                        vel_msg.twist.covariance[0] = packet["fomX"]
-                        vel_msg.twist.covariance[7] = packet["fomY"]
-                        vel_msg.twist.covariance[14] = packet["fomZ"]
-                        self.water_track_velocity_publisher.publish(vel_msg)
+                        self.water_track_velocity_publisher.publish(
+                            self._track_velocity_msg(packet, ros_timestamp))
 
                 except RCLError:
                     pass
