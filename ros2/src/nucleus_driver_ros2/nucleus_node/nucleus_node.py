@@ -33,6 +33,8 @@ from std_msgs.msg import Float32
 from sensor_msgs.msg import Imu, MagneticField, FluidPressure, Temperature
 from geometry_msgs.msg import PointStamped, TwistWithCovarianceStamped
 from nav_msgs.msg import Odometry
+from diagnostic_msgs.msg import DiagnosticStatus
+from diagnostic_updater import Updater
 from nucleus_driver import NucleusDriver
 
 
@@ -125,7 +127,27 @@ class NucleusNode(Node):
         # went away without the socket reporting an error (half-open TCP). None
         # means "no link", so the retry loop owns the next attempt.
         self._last_packet_time = None
+        # --- Diagnostics state ---
+        # Written from the packet thread, read from the updater's timer. Plain
+        # int increments and dict item assignment are atomic under the GIL, and
+        # a diagnostic that is one packet stale does not matter, so these are
+        # deliberately unlocked. The callbacks copy the dict before iterating.
+        self._reconnect_count = 0
+        self._packet_counts = {}
+        self._unknown_packet_count = 0
+        self._bt_last_time = None
+        self._bt_xyz_valid = None
+        self._bt_distance_valid_beams = 0
         self.packet_thread = Thread(target=self.packet_handling)
+
+        # --- Diagnostics ---
+        # Updater publishes on the absolute /diagnostics topic, so this joins the
+        # global topic the other rhody drivers use rather than a namespaced one.
+        self._diag_updater = Updater(self)
+        self._diag_updater.setHardwareID("nucleus_1000")
+        self._diag_updater.add("Connection", self._diag_connection)
+        self._diag_updater.add("Decoder", self._diag_decoder)
+        self._diag_updater.add("Bottom Track", self._diag_bottom_track)
 
         self.get_logger().info("Nucleus Node initiated")
 
@@ -175,6 +197,7 @@ class NucleusNode(Node):
             self.get_logger().warn(f"Invalid connection_type '{self._connection_type}'. Skipping auto-connect.")
 
         if status:
+            self._reconnect_count += 1
             self._enable_tcp_keepalive()
             # Only start the data-timeout clock once there is a link to watch.
             self._last_packet_time = time.monotonic()
@@ -440,6 +463,143 @@ class NucleusNode(Node):
         return response
 
     
+    # --- Diagnostics -------------------------------------------------------
+    # Task names mirror the other rhody drivers (sprintnav/adnav both expose
+    # Connection + Decoder), so the Foxglove diagnostics view reads the same way
+    # across sensors. Bottom Track is the DVL-specific addition: it is what
+    # actually says whether the Nucleus is usable for navigation.
+
+    PACKET_NAMES = {
+        0xD2: "ahrs",
+        0xDC: "ins",
+        0x82: "imu",
+        0x87: "magnetometer",
+        0xB4: "bottom_track",
+        0xBE: "water_track",
+        0xAA: "altimeter",
+        0xC0: "current_profile",
+        0x8B: "field_calibration",
+    }
+
+    @staticmethod
+    def _diag_add(stat, key, value):
+        """
+        Add a key/value pair, stringified.
+
+        diagnostic_updater's Python DiagnosticStatusWrapper.add() assigns the
+        value straight into KeyValue.value with no conversion — its docstring is
+        a stale copy of the C++ one and still talks about std::stringstream. A
+        non-str therefore fails rosidl's PyUnicode_Check assertion and aborts the
+        whole process, so everything goes through str() here.
+        """
+        stat.add(key, str(value))
+
+    def _count_packet(self, packet):
+        packet_id = packet.get("id")
+        name = self.PACKET_NAMES.get(packet_id)
+        if name is None:
+            self._unknown_packet_count += 1
+            return
+        self._packet_counts[name] = self._packet_counts.get(name, 0) + 1
+
+        if packet_id == 0xB4:
+            self._bt_last_time = time.monotonic()
+            self._bt_xyz_valid = (
+                bool(packet.get("status.xVelocityValid")),
+                bool(packet.get("status.yVelocityValid")),
+                bool(packet.get("status.zVelocityValid")),
+            )
+            self._bt_distance_valid_beams = sum(
+                1 for k in ("status.beam1DistanceValid",
+                            "status.beam2DistanceValid",
+                            "status.beam3DistanceValid")
+                if packet.get(k))
+
+    def _listen_only(self):
+        return self._connection_type == 'tcp' and self._tcp_port == 9002
+
+    def _diag_connection(self, stat):
+        connected = self._is_connected()
+        age = (None if self._last_packet_time is None
+               else time.monotonic() - self._last_packet_time)
+        # Staleness threshold for *reporting*. data_timeout_s is deliberately 0
+        # in listen-only mode (silence there is legitimate), so it cannot double
+        # as the reporting threshold or this task would never go stale at all.
+        stale_after = self._data_timeout_s if self._data_timeout_s > 0 else 5.0
+
+        if not connected:
+            stat.summary(DiagnosticStatus.ERROR, "not connected")
+        elif age is None:
+            stat.summary(DiagnosticStatus.WARN, "connected, no data yet")
+        elif age > stale_after:
+            if self._listen_only():
+                # Not an error: an external client owns start/stop, so this is
+                # just how a device nobody has started measuring on looks.
+                stat.summary(DiagnosticStatus.WARN,
+                             "connected, no data - is measurement started?")
+            else:
+                stat.summary(DiagnosticStatus.ERROR, "data timeout")
+        else:
+            stat.summary(DiagnosticStatus.OK, "receiving")
+
+        self._diag_add(stat, "mode", "listen-only" if self._listen_only() else "full control")
+        self._diag_add(stat, "transport", self._connection_type)
+        self._diag_add(stat, "endpoint", f"{self._tcp_ip}:{self._tcp_port}"
+                 if self._connection_type == 'tcp' else self._serial_port)
+        self._diag_add(stat, "connected", connected)
+        self._diag_add(stat, "seconds since last data", "never" if age is None else round(age, 2))
+        self._diag_add(stat, "connects", self._reconnect_count)
+        self._diag_add(stat, "reconnect interval s", self._reconnect_interval_s)
+        self._diag_add(stat, "data timeout s", self._data_timeout_s)
+        self._diag_add(stat, "keepalive idle s", self._tcp_keepalive_idle_s)
+        return stat
+
+    def _diag_decoder(self, stat):
+        counts = dict(self._packet_counts)
+        total = sum(counts.values())
+        unknown = self._unknown_packet_count
+
+        if total == 0 and unknown == 0:
+            stat.summary(DiagnosticStatus.STALE, "no packets decoded yet")
+        elif unknown:
+            # Usually a firmware/parser mismatch: the device is emitting packet
+            # IDs this build does not know, which is otherwise silent data loss.
+            stat.summary(DiagnosticStatus.WARN,
+                         f"{unknown} unrecognised packet(s) - firmware/parser mismatch?")
+        else:
+            stat.summary(DiagnosticStatus.OK, f"decoding {total} packets")
+
+        self._diag_add(stat, "total packets", total)
+        self._diag_add(stat, "unrecognised packets", unknown)
+        for name in sorted(counts):
+            self._diag_add(stat, f"packets: {name}", counts[name])
+        return stat
+
+    def _diag_bottom_track(self, stat):
+        if self._bt_last_time is None:
+            stat.summary(DiagnosticStatus.STALE, "no bottom track packets yet")
+            self._diag_add(stat, "bottom lock", False)
+            return stat
+
+        age = time.monotonic() - self._bt_last_time
+        xyz = self._bt_xyz_valid or (False, False, False)
+        locked = all(xyz)
+
+        if age > 5.0:
+            stat.summary(DiagnosticStatus.WARN, f"no bottom track for {age:.1f} s")
+        elif locked:
+            stat.summary(DiagnosticStatus.OK, "bottom lock")
+        else:
+            # Expected off-bottom or out of range: the vehicle simply has no DVL
+            # velocity solution right now.
+            stat.summary(DiagnosticStatus.WARN, "no bottom lock")
+
+        self._diag_add(stat, "bottom lock", locked)
+        self._diag_add(stat, "x/y/z velocity valid", "{}/{}/{}".format(*xyz))
+        self._diag_add(stat, "beams with valid distance", self._bt_distance_valid_beams)
+        self._diag_add(stat, "seconds since last bottom track", round(age, 2))
+        return stat
+
     def packet_handling(self):
 
         while self._thread_running and rclpy.ok():
@@ -472,6 +632,7 @@ class NucleusNode(Node):
                 continue
 
             self._last_packet_time = time.monotonic()
+            self._count_packet(packet)
 
             system_timestamp = self.get_clock().now()
             ros_timestamp = system_timestamp.to_msg()
