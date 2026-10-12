@@ -140,7 +140,11 @@ class NucleusNode(Node):
         # deliberately unlocked. The callbacks copy the dict before iterating.
         self._reconnect_count = 0
         self._packet_counts = {}
-        self._unknown_packet_count = 0
+        # Parser-decoded IDs this node has no publisher for, keyed by name.
+        self._unpublished_packet_counts = {}
+        # IDs the parser itself does not know, keyed by the raw int ID so the
+        # diagnostic can say *which* IDs are arriving, not just how many.
+        self._unknown_packet_counts = {}
         self._bt_last_time = None
         self._bt_xyz_valid = None
         self._bt_distance_valid_beams = 0
@@ -493,6 +497,20 @@ class NucleusNode(Node):
         0x8B: "field_calibration",
     }
 
+    # IDs the nucleus_driver parser decodes but this node does not publish.
+    # They are counted separately so the Decoder task does not call a packet
+    # the parser fully understands a "firmware/parser mismatch".
+    UNPUBLISHED_PACKET_NAMES = {
+        0x96: "fast_pressure",
+        0xA0: "ascii",
+        0xC1: "adcp",
+        0x20: "spectrum_analyzer",
+    }
+
+    # Nortek reports Nucleus pressure in bar; sensor_msgs/FluidPressure and the
+    # depth conversion both want pascals.
+    BAR_TO_PA = 100000.0
+
     @staticmethod
     def _diag_add(stat, key, value):
         """
@@ -510,7 +528,13 @@ class NucleusNode(Node):
         packet_id = packet.get("id")
         name = self.PACKET_NAMES.get(packet_id)
         if name is None:
-            self._unknown_packet_count += 1
+            dropped = self.UNPUBLISHED_PACKET_NAMES.get(packet_id)
+            if dropped is not None:
+                self._unpublished_packet_counts[dropped] = (
+                    self._unpublished_packet_counts.get(dropped, 0) + 1)
+            else:
+                self._unknown_packet_counts[packet_id] = (
+                    self._unknown_packet_counts.get(packet_id, 0) + 1)
             return
         self._packet_counts[name] = self._packet_counts.get(name, 0) + 1
 
@@ -716,23 +740,31 @@ class NucleusNode(Node):
 
     def _diag_decoder(self, stat):
         counts = dict(self._packet_counts)
+        unpublished = dict(self._unpublished_packet_counts)
+        unknown = dict(self._unknown_packet_counts)
         total = sum(counts.values())
-        unknown = self._unknown_packet_count
+        unknown_total = sum(unknown.values())
 
-        if total == 0 and unknown == 0:
+        if total == 0 and not unpublished and not unknown:
             stat.summary(DiagnosticStatus.STALE, "no packets decoded yet")
         elif unknown:
             # Usually a firmware/parser mismatch: the device is emitting packet
-            # IDs this build does not know, which is otherwise silent data loss.
+            # IDs the parser does not know, which is otherwise silent data loss.
+            # Name the IDs so the mismatch can be chased without a packet dump.
+            ids = ", ".join(f"0x{pid:02X} x{n}" for pid, n in sorted(unknown.items()))
             stat.summary(DiagnosticStatus.WARN,
-                         f"{unknown} unrecognised packet(s) - firmware/parser mismatch?")
+                         f"{unknown_total} unrecognised packet(s) [{ids}] - firmware/parser mismatch?")
         else:
             stat.summary(DiagnosticStatus.OK, f"decoding {total} packets")
 
         self._diag_add(stat, "total packets", total)
-        self._diag_add(stat, "unrecognised packets", unknown)
+        self._diag_add(stat, "unrecognised packets", unknown_total)
+        for pid in sorted(unknown):
+            self._diag_add(stat, f"unrecognised: 0x{pid:02X}", unknown[pid])
         for name in sorted(counts):
             self._diag_add(stat, f"packets: {name}", counts[name])
+        for name in sorted(unpublished):
+            self._diag_add(stat, f"not published: {name}", unpublished[name])
         return stat
 
     def _diag_bottom_track(self, stat):
@@ -1163,15 +1195,15 @@ class NucleusNode(Node):
                         pressure_msg = FluidPressure()
                         pressure_msg.header.stamp = ros_timestamp
                         pressure_msg.header.frame_id = self.frame_id
-                        pressure_msg.fluid_pressure = packet["pressure"]
+                        pressure_msg.fluid_pressure = packet["pressure"] * self.BAR_TO_PA
                         self.pressure_publisher.publish(pressure_msg)
 
                         depth_msg = Odometry()
                         depth_msg.header.stamp = ros_timestamp
                         depth_msg.header.frame_id = self.world_frame_id
                         depth_msg.child_frame_id = self.frame_id
-                        # convert the pressure (Bar) to depth (m)
-                        depth_converted = (packet["pressure"] * 100000.0) / (self._fluid_density * 9.81)
+                        # convert the pressure (bar) to depth (m)
+                        depth_converted = (packet["pressure"] * self.BAR_TO_PA) / (self._fluid_density * 9.81)
                         depth_msg.pose.pose.position.x = 0.0
                         depth_msg.pose.pose.position.y = 0.0
                         depth_msg.pose.pose.position.z = -depth_converted
