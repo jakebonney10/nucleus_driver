@@ -291,6 +291,12 @@ class NucleusNode(Node):
                 self.get_logger().warn(
                     "auto_start is set but will be ignored in listen-only mode."
                 )
+            # The parser thread is the only thing that drains the socket and is
+            # normally started by start_measurement(), which listen-only mode
+            # skips. Without it the stream is never read: packet_queue stays
+            # empty and the kernel Recv-Q fills until the Nucleus stops sending.
+            if not self.nucleus_driver.parser.thread_running:
+                self.nucleus_driver.parser.start()
 
         # Send configuration commands
         if self._sensor_configs and not streaming_only:

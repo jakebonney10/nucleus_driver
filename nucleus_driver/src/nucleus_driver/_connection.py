@@ -384,8 +384,18 @@ class Connection:
 
         def _disconnect_tcp():
 
+            # shutdown() raises ENOTCONN once the peer has reset the connection
+            # (device power-cycled, keepalive answered with RST). That used to
+            # abort the whole disconnect, leaving the socket open and _connected
+            # True, so connect() then refused with "already connected" forever.
+            # A dead peer is exactly when we must still tear down, so the
+            # shutdown error is ignored and close() always runs.
             try:
                 self.tcp.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+            try:
                 self.tcp.close()
 
                 time.sleep(0.01)
@@ -396,7 +406,7 @@ class Connection:
                 return True
 
             except Exception as exception:
-                self.messages.write_exception(message='Failed to disconnet from serial connection: {}'.format(exception))
+                self.messages.write_exception(message='Failed to disconnect from tcp connection: {}'.format(exception))
 
                 return False
 
